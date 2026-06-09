@@ -1,0 +1,228 @@
+from playwright.sync_api import sync_playwright
+import pandas as pd
+import datetime
+import jieba.analyse
+from snownlp import SnowNLP
+from collections import Counter
+import re
+import json
+import jieba
+
+jieba.setLogLevel(20)  # 关闭jieba日志
+
+print("=" * 60)
+print("携程评论采集系统（完整版：爬取+清洗+标签+知识库）")
+print("=" * 60)
+
+url = input("请输入携程景点URL：\n").strip()
+
+try:
+    max_pages = int(input("请输入要抓取的页数（默认30页）: ") or 30)
+except:
+    max_pages = 30
+
+all_comments = []
+
+# =========================
+# 1️⃣ 爬虫
+# =========================
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=False)
+    page = browser.new_page()
+    page.goto(url, wait_until="networkidle")
+    page.wait_for_timeout(3000)
+
+    current_page = 1
+
+    while current_page <= max_pages:
+        print(f"\n📄 第 {current_page} 页")
+
+        comments = page.locator("div.commentDetail")
+        count = comments.count()
+
+        for i in range(count):
+            try:
+                text = comments.nth(i).inner_text().strip()
+                if text:
+                    all_comments.append({
+                        "页码": current_page,
+                        "评论": text
+                    })
+            except:
+                continue
+
+        print(f"累计：{len(all_comments)}")
+
+        try:
+            next_btn = page.locator("text=下一页")
+            if next_btn.count() == 0:
+                break
+            next_btn.click()
+            page.wait_for_timeout(2000)
+            current_page += 1
+        except:
+            break
+
+    browser.close()
+
+# =========================
+# 2️⃣ 清洗
+# =========================
+if not all_comments:
+    print("❌ 没有数据")
+    exit()
+
+df = pd.DataFrame(all_comments)
+
+df = df[df["评论"].str.strip() != ""]
+df["评论"] = df["评论"].str.strip()
+df.drop_duplicates(subset=["评论"], inplace=True)
+df = df[df["评论"].str.len() >= 5]
+
+def normalize(text):
+    return re.sub(r"[^\u4e00-\u9fa5]", "", text)
+
+df["clean"] = df["评论"].apply(normalize)
+df.drop_duplicates(subset=["clean"], inplace=True)
+df.drop(columns=["clean"], inplace=True)
+
+# =========================
+# 3️⃣ 情感分析
+# =========================
+def sentiment(text):
+    try:
+        s = SnowNLP(text).sentiments
+        if s > 0.6:
+            return "正面"
+        elif s < 0.4:
+            return "负面"
+        return "中性"
+    except:
+        return "中性"
+
+# =========================
+# 4️⃣ 标签
+# =========================
+def tag(text):
+    tags = []
+    if any(x in text for x in ["风景","景色","拍照","山","湖","古"]):
+        tags.append("风景")
+    if any(x in text for x in ["排队","拥挤","人多"]):
+        tags.append("人流")
+    if any(x in text for x in ["门票","价格","贵","性价比"]):
+        tags.append("价格")
+    if any(x in text for x in ["交通","停车","公交"]):
+        tags.append("交通")
+    if not tags:
+        tags.append("其他")
+    return "|".join(tags)
+
+# =========================
+# 5️⃣ 关键词（优化过滤）
+# =========================
+STOPWORDS = {"真的","非常","感觉","就是","这里","那个","一个","我们","他们"}
+
+TRAVEL_WORDS = {"风景","拍照","景区","古镇","文化","门票","排队","人多","安静","漂亮","山","水"}
+
+def keywords(text, topK=5):
+    words = jieba.analyse.extract_tags(text, topK=20)
+    res = []
+
+    for w in words:
+        if len(w) < 2:
+            continue
+        if w in STOPWORDS:
+            continue
+        if w in TRAVEL_WORDS:
+            res.append(w)
+
+    if len(res) < 2:
+        for w in words:
+            if w not in STOPWORDS and len(w) > 1:
+                res.append(w)
+
+    return "|".join(res[:topK])
+
+# =========================
+# 应用
+# =========================
+df["情感"] = df["评论"].apply(sentiment)
+df["标签"] = df["评论"].apply(tag)
+df["关键词"] = df["评论"].apply(lambda x: keywords(x))
+
+# =========================
+# 6️⃣ 知识库
+# =========================
+def build_kb(df):
+    kb = {
+        "景点名称": "携程景点",
+        "评论总数": len(df),
+        "评论列表": [],
+        "统计": {},
+        "热门关键词": [],
+        "正面总结": [],
+        "负面总结": []
+    }
+
+    for i, row in df.iterrows():
+        kb["评论列表"].append({
+            "id": int(i),
+            "内容": row["评论"],
+            "情感": row["情感"],
+            "标签": row["标签"],
+            "关键词": row["关键词"]
+        })
+
+    # 情感统计
+    s = df["情感"].value_counts().to_dict()
+    kb["统计"]["情感"] = s
+    total = len(df)
+    kb["统计"]["正面率"] = round(s.get("正面", 0) / total, 3)
+    kb["统计"]["负面率"] = round(s.get("负面", 0) / total, 3)
+
+    # 标签统计
+    tag_count = {}
+    for t in df["标签"]:
+        for x in t.split("|"):
+            tag_count[x] = tag_count.get(x, 0) + 1
+    kb["统计"]["标签"] = tag_count
+
+    # 热词
+    all_kw = []
+    for k in df["关键词"]:
+        all_kw.extend(k.split("|"))
+
+    kb["热门关键词"] = [w for w, _ in Counter(all_kw).most_common(10)]
+
+    # 总结
+    for _, row in df.iterrows():
+        if row["情感"] == "正面":
+            kb["正面总结"].append(row["评论"])
+        elif row["情感"] == "负面":
+            kb["负面总结"].append(row["评论"])
+
+    kb["正面总结"] = kb["正面总结"][:10]
+    kb["负面总结"] = kb["负面总结"][:10]
+
+    return kb
+
+kb = build_kb(df)
+
+# =========================
+# 7️⃣ 保存
+# =========================
+time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+csv_file = f"ctrip_{time}.csv"
+json_file = f"ctrip_kb_{time}.json"
+
+df.to_csv(csv_file, index=False, encoding="utf-8-sig")
+
+with open(json_file, "w", encoding="utf-8") as f:
+    json.dump(kb, f, ensure_ascii=False, indent=2)
+
+print("\n====================")
+print("✅ 完成")
+print("CSV:", csv_file)
+print("KB:", json_file)
+print("====================")
