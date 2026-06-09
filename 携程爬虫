@@ -1,0 +1,251 @@
+from playwright.sync_api import sync_playwright
+import pandas as pd
+import datetime
+import jieba.analyse
+from snownlp import SnowNLP
+from collections import Counter
+import re
+
+print("=" * 60)
+print("携程评论采集系统（爬取+清洗+标签+关键词+统计）")
+print("=" * 60)
+
+url = input("请输入携程景点URL：\n").strip()
+
+# 用户可指定抓取页数，默认30页
+try:
+    max_pages = int(input("请输入要抓取的页数（默认30页）: ") or 30)
+except:
+    max_pages = 30
+
+all_comments = []
+
+# =========================
+# 开始爬取
+# =========================
+with sync_playwright() as p:
+
+    browser = p.chromium.launch(headless=False)
+    page = browser.new_page()
+    page.goto(url, wait_until="networkidle")
+    page.wait_for_timeout(5000)
+
+    current_page = 1
+
+    while current_page <= max_pages:
+
+        print(f"\n正在抓取第 {current_page} 页...")
+
+        page.wait_for_timeout(3000)
+
+        comments = page.locator("div.commentDetail")
+        count = comments.count()
+        print(f"本页发现 {count} 条评论")
+
+        for i in range(count):
+            try:
+                content = comments.nth(i).inner_text().strip()
+                if content:
+                    all_comments.append({
+                        "页码": current_page,
+                        "评论": content
+                    })
+            except:
+                continue
+
+        print(f"累计抓取：{len(all_comments)} 条")
+
+        # 点击下一页
+        try:
+            next_btn = page.locator("text=下一页")
+            if next_btn.count() == 0 or not next_btn.is_visible():
+                print("\n已经到最后一页")
+                break
+            next_btn.click()
+            page.wait_for_load_state("networkidle")
+            current_page += 1
+        except Exception as e:
+            print("\n翻页失败：", e)
+            break
+
+    browser.close()
+
+# =========================
+# 数据清洗
+# =========================
+if len(all_comments) == 0:
+    print("\n⚠️ 没有抓取到任何评论")
+    exit()
+
+df = pd.DataFrame(all_comments)
+
+# 去空评论
+df = df[df["评论"].astype(str).str.strip() != ""]
+
+# 清理首尾空格
+df["评论"] = df["评论"].astype(str).str.strip()
+
+# 去重
+df.drop_duplicates(subset=["评论"], inplace=True)
+
+# 去掉长度太短的无效评论
+df = df[df["评论"].str.len() >= 5]
+
+# 相似评论去重
+def normalize_text(text):
+    text = re.sub(r"[^\u4e00-\u9fa5]", "", text)
+    return text
+
+df["去重文本"] = df["评论"].apply(normalize_text)
+df.drop_duplicates(subset=["去重文本"], inplace=True)
+df.drop(columns=["去重文本"], inplace=True)
+
+# =========================
+# 情感分析
+# =========================
+def sentiment_tag(text):
+    try:
+        score = SnowNLP(text).sentiments
+        if score >= 0.65:
+            return "正面"
+        elif score <= 0.35:
+            return "负面"
+        else:
+            return "中性"
+    except:
+        return "中性"
+
+# =========================
+# 标签分类
+# =========================
+def aspect_tag(text):
+    tags = []
+    if any(k in text for k in ["风景","景色","美景","拍照","自然","古建筑","湖","山","文化"]):
+        tags.append("风景/体验")
+    if any(k in text for k in ["交通","地铁","公交","停车","步行"]):
+        tags.append("交通")
+    if any(k in text for k in ["门票","票价","价格","贵","优惠","便宜","团购","性价比"]):
+        tags.append("价格/门票")
+    if any(k in text for k in ["排队","拥挤","人多","客流","少","人少"]):
+        tags.append("人流/拥挤")
+    if any(k in text for k in ["服务","工作人员","导游","餐饮","厕所","休息"]):
+        tags.append("服务/设施")
+    if any(k in text for k in ["脏","卫生","危险","安全","维护"]):
+        tags.append("安全/卫生")
+    if any(k in text for k in ["酒店","民宿","住宿","房间","舒适"]):
+        tags.append("住宿")
+    if any(k in text for k in ["商店","纪念品","购物","其他"]):
+        tags.append("购物/其他")
+    if not tags:
+        tags.append("其他")
+    return "|".join(tags)
+
+# =========================
+# 评论关键词提取
+# =========================
+TRAVEL_KEYWORDS = set([
+    # 景观类
+    "风景","景色","自然","山","水","湖","海","森林","古镇","古城","寺庙","文化","建筑",
+
+    # 体验类
+    "拍照","打卡","游玩","观光","徒步","登山","骑行","游船","夜景","日出","日落",
+
+    # 设施类
+    "交通","停车","地铁","公交","路线","指示","厕所","服务","导游",
+
+    # 消费类
+    "门票","票价","价格","性价比","优惠","团购","免费",
+
+    # 人流体验
+    "排队","拥挤","人流","安静","清静","冷门","热门",
+
+    # 住宿餐饮
+    "酒店","民宿","餐厅","美食","小吃"
+])
+
+# 通用垃圾词（必须过滤）
+STOPWORDS = set([
+    "真的","非常","特别","感觉","还是","一下","可以","就是",
+    "一个","这里","那里","地方","时候","不会","没有","我们",
+    "你们","他们","这个","那个","很多","比较","一般","不错"
+])
+
+def extract_keywords(text, topK=5):
+
+    try:
+        # 1️⃣ 提取候选关键词
+        keywords = jieba.analyse.extract_tags(text, topK=20)
+
+        clean_keywords = []
+
+        for k in keywords:
+
+            # 2️⃣ 过滤长度
+            if len(k) < 2:
+                continue
+
+            # 3️⃣ 过滤停用词
+            if k in STOPWORDS:
+                continue
+
+            # 4️⃣ 旅游语义约束（重点）
+            if k in TRAVEL_KEYWORDS:
+                clean_keywords.append(k)
+
+        # 5️⃣ 如果过滤后太少，做兜底（防止空）
+        if len(clean_keywords) < 2:
+            for k in keywords:
+                if len(k) >= 2 and k not in STOPWORDS:
+                    clean_keywords.append(k)
+
+        return "|".join(clean_keywords[:topK]) if clean_keywords else "其他"
+
+    except:
+        return "其他"
+
+# =========================
+# 应用情感、标签和关键词
+# =========================
+df["情感"] = df["评论"].apply(sentiment_tag)
+df["标签"] = df["评论"].apply(aspect_tag)
+df["关键词"] = df["评论"].apply(lambda x: extract_keywords(x, topK=5))
+
+# =========================
+# 保存CSV
+# =========================
+now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+file_name = f"ctrip_comments_{now}.csv"
+df.to_csv(file_name, index=False, encoding="utf-8-sig")
+print(f"\n✅ 抓取完成，已保存CSV：{file_name}")
+
+# =========================
+# 标签占比统计
+# =========================
+tag_counts = {}
+for t in df["标签"]:
+    for tag in t.split("|"):
+        tag_counts[tag] = tag_counts.get(tag,0)+1
+
+print("\n🎯 各标签统计：")
+total = len(df)
+for tag, count in tag_counts.items():
+    print(f"{tag}: {count} 条，占比 {count/total*100:.2f}%")
+
+sentiment_counts = df["情感"].value_counts()
+print("\n💡 情感统计：")
+for s, c in sentiment_counts.items():
+    print(f"{s}: {c} 条，占比 {c/total*100:.2f}%")
+
+# =========================
+# 关键词热词统计
+# =========================
+all_keywords = []
+for k in df["关键词"]:
+    if isinstance(k, str):
+        all_keywords.extend(k.split("|"))
+
+keyword_counts = Counter(all_keywords)
+print("\n🔑 评论关键词热词TOP30：")
+for word, count in keyword_counts.most_common(30):
+    if len(word) > 1:
+        print(f"{word}: {count} 次")
